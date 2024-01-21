@@ -1,0 +1,4 @@
+config COMENTO_DRIVER
+    bool "Comento SoC device drivers"
+    help
+        This enables device drivers for Comento SoC

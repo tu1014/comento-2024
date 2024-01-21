@@ -1,0 +1,1 @@
+dtb-$(CONFIG_ARCH_COMENTO) += comento.dtb

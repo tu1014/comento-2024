@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "sysbus.h": "c",
+        "boards.h": "c",
+        "comento.h": "c"
+    }
+}
