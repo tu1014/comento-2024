@@ -5,6 +5,7 @@
 #include <linux/amba/bus.h>
 #include <linux/dmaengine.h>
 #include <linux/dma-mapping.h>
+#include <linux/gpio/consumer.h>
 
 #define COMENTO_DR        0x00    /* Data register */
 #define COMENTO_FR        0x04    /* Flag register */
@@ -35,12 +36,12 @@ struct comento_dma_buf {
 };
 
 struct comento_mmio_device {
-        struct device *dev;
-        void __iomem *base;
-        rwlock_t lock;
-        unsigned int minor;
-        wait_queue_head_t tx_wq; // 대기 큐의 헤드를 선언
-        struct hlist_node hash;
+    struct device *dev;
+    void __iomem *base;
+    rwlock_t lock;
+    unsigned int minor;
+    wait_queue_head_t tx_wq; // 대기 큐의 헤드를 선언
+    struct hlist_node hash;
     struct work_struct rx_work; // rx_buf 등 데이터 찾기 쉽게 하기 위해
     char rx_buf[32];            // 같은 데이터 구조체 내 work_struct 선언
     int rx_size;
@@ -49,6 +50,10 @@ struct comento_mmio_device {
     struct comento_dma_buf rx;
     struct work_struct rx_dma_work; // 더 이상 수신할 데이터가 없어서
     // 인터럽트를 발생된 경우, DMA를 중단하기 위한 워크 큐 (Bottom half)
+
+    struct gpio_descs *leds;
+    struct gpio_desc *button;
+    struct gpio_descs *segments;
 };
 
 static unsigned int comento_mmio_major;
@@ -86,6 +91,7 @@ static void comento_dma_rx_callback(void *data)
     dma_unmap_sg(cmdev->dev->parent, &cmdev->rx.sg, 1, DMA_FROM_DEVICE);
     // DMA 동작 중이 아님으로 변경
     cmdev->rx.queued = false;
+    gpiod_set_value(cmdev->leds->desc[1], 0);
 }
 
 
@@ -106,6 +112,9 @@ static void comento_mmio_rx_dma_work_handler(struct work_struct *work)
     dmaengine_tx_status(cmdev->rx.chan, cmdev->rx.cookie, &state);
     // 여태까지 받은 크기 = 스캐터리스트 크기 – DMA 작업 남은 바이트 수
     cmdev->rx_size = cmdev->rx.sg.length - state.residue;
+    if (cmdev->rx_size != 0) {
+        gpiod_set_value(cmdev->leds->desc[2], 1); 
+    }
     // 만약 DMA가 동작 중이라면, DMA 작업을 완전히 중단시킴
     if (cmdev->rx.queued) {
         dmaengine_terminate_sync(cmdev->rx.chan);
@@ -113,6 +122,26 @@ static void comento_mmio_rx_dma_work_handler(struct work_struct *work)
     }
 }
 
+// GPIO 핀의 값이 변하는지 체크 하는 것은 인터럽트 처리처럼 구현
+// 인터럽트 핸들러를 구현하여 설정하면, GPIO 핀 값에 따라 핸들러가 호출됨
+static irqreturn_t comento_button_interrupt(int irq, void *dev_id)
+{
+    struct comento_mmio_device *cmdev = dev_id;
+
+    // rx_size를 변경해야 하므로 spinlock으로 보호 필요
+    write_lock(&cmdev->lock);
+
+    // 인터럽트 핸들러가 라이징 엣지인 상황에 호출되면,
+    // 수신한 데이터가 없는 것처럼 rx_size를 0으로 설정
+    cmdev->rx_size = 0;
+    // 수신할 데이터가 없으므로 핀 2을 LOW로 설정
+    gpiod_set_value(cmdev->leds->desc[2], 0);
+
+    write_unlock(&cmdev->lock);
+
+    // 처리가 완료 되었음을 반환
+    return IRQ_HANDLED;
+}
 
 static int comento_dma_probe(struct amba_device *adev,
                              struct comento_mmio_device *cmdev)
@@ -172,6 +201,7 @@ static void comento_dma_tx_callback(void *data)
     dma_unmap_sg(cmdev->dev->parent, &cmdev->tx.sg, 1, DMA_TO_DEVICE);
     // DMA 동작 중이 아님으로 변경
     cmdev->tx.queued = false;
+    gpiod_set_value(cmdev->leds->desc[0], 0);
     // DMA가 동작 중 아님으로 바뀌길 원하는 대기 큐 깨우기
     wake_up_interruptible(&cmdev->tx_wq);
 }
@@ -220,6 +250,7 @@ static ssize_t comento_mmio_write(struct file *fp, const char __user *buf,
         desc->callback_param = cmdev;
        // DMA 동작 중으로 설정
         cmdev->tx.queued = true;
+	gpiod_set_value(cmdev->leds->desc[0], 1); 
 
         // DMA 작업 등록
         cmdev->tx.cookie = dmaengine_submit(desc);
@@ -305,6 +336,7 @@ static void comento_mmio_rx_work_handler(struct work_struct *work)
     desc->callback = comento_dma_rx_callback;
     desc->callback_param = cmdev;
     cmdev->rx.queued = true; // DMA 동작 중으로 설정
+    gpiod_set_value(cmdev->leds->desc[1], 1); 
 
     cmdev->rx.cookie = dmaengine_submit(desc); // DMA 작업 등록
     // 등록한 DMA 작업 바로 시작
@@ -349,7 +381,7 @@ static struct file_operations comento_mmio_fops = {
 static int comento_mmio_probe(struct amba_device *adev,
                               const struct amba_id *id)
 {
-    int ret;
+    int ret, irq;
     struct comento_mmio_device *cmdev;
 
     ret = amba_request_regions(adev, NULL); // 사용할 물리주소 미리 요청
@@ -434,6 +466,29 @@ static int comento_mmio_probe(struct amba_device *adev,
     init_waitqueue_head(&cmdev->tx_wq);
 
     INIT_WORK(&cmdev->rx_work, comento_mmio_rx_work_handler);
+
+    /*// 디바이스 트리에서 led-gpios로 설정된 GPIO 핀들을 배열로 얻어옴
+    // 해당 GPIO 핀은 출력용으로 사용하며 초기 값은 Low로 하도록 설정
+    cmdev->leds = devm_gpiod_get_array(&adev->dev, "led", GPIOD_OUT_LOW);
+
+    // 디바이스 트리에서 button-gpios로 설정된 GPIO 핀을 얻어옴
+    // 해당 GPIO 핀은 입력용으로 사용하도록 설정
+    cmdev->button = devm_gpiod_get(&adev->dev, "button", GPIOD_IN);*/
+
+    // 7-segment led
+    cmdev->segments = devm_gpiod_get_array(&adev->dev, "7-segment-led", GPIOD_OUT_LOW);
+
+    // 입력용 GPIO 핀의 값 변화를 체크하기 위해 인터럽트로 변경
+    irq = gpiod_to_irq(cmdev->button);
+
+    // GIC에서 발생하는 인터럽트처럼
+    // GPIO 핀의 변화 발생시 핸들러가 호출됨
+    ret = devm_request_irq(&adev->dev, irq,  comento_button_interrupt,
+                          // 언제 핸들러가 호출될지를 지정, 여기서는
+                          // 라이징 엣지일 때 핸들러가 호출되도록 설정
+                          IRQF_TRIGGER_RISING,
+                          "mmio-comento-gpio", cmdev);
+
 
 
     return 0;
